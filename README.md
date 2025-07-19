@@ -11,7 +11,7 @@ ETWLocksmith reads ETW provider security permissions from the Windows registry a
 - 🔍 **Search by GUID**: Find providers by their GUID with automatic name resolution
 - 🔍 **Search by Name**: Find providers by name (case-insensitive partial matching)
 - 🔍 **Search by Permission**: Find all providers with specific permissions
-- 📋 **List All Providers**: Display all registered ETW providers with their permissions
+- 📋 **List All Providers**: Display all registered ETW providers if they have specific permissions
 - 📁 **Load from File**: Analyze providers from a JSON file
 - 📤 **Export Data**: Export provider data to JSON or CSV formats
 - 🔐 **Permission Analysis**: Detailed breakdown of ETW-specific permissions

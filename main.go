@@ -12,6 +12,7 @@ import (
 	"unsafe"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
@@ -163,40 +164,49 @@ func (e *ETWLocksmith) LoadProviders() error {
 func (e *ETWLocksmith) resolveProviderName(guid string) string {
 	guidKey := strings.Trim(guid, "{}")
 
+	// Try WINEVT Publishers first (most common location)
+	if name := e.getProviderNameFromWINEVT(guidKey); name != "" {
+		return name
+	}
+
+	// Try WBEM providers
 	if name := e.getProviderNameFromWBEM(guidKey); name != "" {
 		return name
 	}
 
-	if name := e.getProviderNameFromKey(`SYSTEM\CurrentControlSet\Control\WMI\Security`, guidKey); name != "" {
-		return name
+	// Try various registry locations
+	registryPaths := []string{
+		`SYSTEM\CurrentControlSet\Control\WMI\Security`,
+		`SOFTWARE\Microsoft\Windows NT\CurrentVersion\WMI\Security`,
+		`SYSTEM\CurrentControlSet\Control\WMI\Autologger`,
+		`SYSTEM\CurrentControlSet\Services\EventLog\Application`,
+		`SYSTEM\CurrentControlSet\Services\EventLog\System`,
+		`SYSTEM\CurrentControlSet\Services\EventLog\Security`,
+		`SOFTWARE\Microsoft\Windows\CurrentVersion\WINEVT\Publishers`,
 	}
 
-	if name := e.getProviderNameFromKey(`SOFTWARE\Microsoft\Windows NT\CurrentVersion\WMI\Security`, guidKey); name != "" {
-		return name
+	for _, path := range registryPaths {
+		if name := e.getProviderNameFromKey(path, guidKey); name != "" {
+			return name
+		}
 	}
 
-	if name := e.getProviderNameFromKey(`SYSTEM\CurrentControlSet\Control\WMI\Autologger`, guidKey); name != "" {
-		return name
-	}
-
-	if name := e.getProviderNameFromKey(`SOFTWARE\Microsoft\Windows\CurrentVersion\WINEVT\Publishers`, guidKey); name != "" {
-		return name
-	}
-
-	if name := e.getProviderNameFromKey(`SYSTEM\CurrentControlSet\Services\EventLog\Application`, guidKey); name != "" {
-		return name
-	}
-
-	if name := e.getProviderNameFromKey(`SYSTEM\CurrentControlSet\Services\EventLog\System`, guidKey); name != "" {
-		return name
-	}
-
-	if name := e.getProviderNameFromKey(`SYSTEM\CurrentControlSet\Services\EventLog\Security`, guidKey); name != "" {
-		return name
-	}
-
+	// Try well-known providers
 	if name := e.getWellKnownProviderName(guidKey); name != "" {
 		return name
+	}
+
+	// Try additional locations that might contain provider names
+	additionalPaths := []string{
+		`SOFTWARE\Microsoft\Windows\CurrentVersion\WINEVT\Channels`,
+		`SYSTEM\CurrentControlSet\Control\Class\{4d36e96c-e325-11ce-bfc1-08002be10318}`,
+		`SOFTWARE\Microsoft\Windows\CurrentVersion\WINEVT\Providers`,
+	}
+
+	for _, path := range additionalPaths {
+		if name := e.getProviderNameFromKey(path, guidKey); name != "" {
+			return name
+		}
 	}
 
 	return "Unknown Provider"
@@ -525,6 +535,393 @@ func (e *ETWLocksmith) parseETWPermissions(mask uint32) []string {
 	return permissions
 }
 
+// SetProviderPermissions creates or updates ETW provider permissions in the registry
+func (e *ETWLocksmith) SetProviderPermissions(guid string, permissions []Permission) error {
+	// Normalize GUID format
+	guid = strings.ToUpper(strings.Trim(guid, "{}"))
+	if !strings.HasPrefix(guid, "{") {
+		guid = "{" + guid + "}"
+	}
+
+	// Build security descriptor
+	securityDescriptor, err := e.buildSecurityDescriptor(permissions)
+	if err != nil {
+		return fmt.Errorf("failed to build security descriptor: %v", err)
+	}
+
+	// Open or create registry key
+	key, err := registry.OpenKey(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Control\WMI\Security`, registry.SET_VALUE|registry.CREATE_SUB_KEY)
+	if err != nil {
+		return fmt.Errorf("failed to open WMI Security registry key: %v", err)
+	}
+	defer key.Close()
+
+	// Write security descriptor to registry
+	guidValue := strings.Trim(guid, "{}")
+	err = key.SetBinaryValue(guidValue, securityDescriptor)
+	if err != nil {
+		return fmt.Errorf("failed to write security descriptor to registry: %v", err)
+	}
+
+	log.Printf("Successfully set permissions for provider %s", guid)
+
+	// Update in-memory representation
+	provider := &Provider{
+		GUID:                          guid,
+		SecurityPermissionsRegistered: true,
+		Permissions:                   permissions,
+		RawSecurity:                   securityDescriptor,
+	}
+
+	// Try to resolve provider name
+	provider.Name = e.resolveProviderName(guidValue)
+	if provider.Name == "" {
+		provider.Name = "Unknown Provider"
+	}
+
+	e.providers[guid] = provider
+
+	return nil
+}
+
+// buildSecurityDescriptor creates a Windows security descriptor from permissions
+func (e *ETWLocksmith) buildSecurityDescriptor(permissions []Permission) ([]byte, error) {
+	// This is a simplified implementation. For production use, you might want to use
+	// more sophisticated Windows API calls or libraries for security descriptor creation.
+
+	// Start with a basic security descriptor structure
+	var buffer []byte
+
+	// Security descriptor header
+	sd := SecurityDescriptor{
+		Revision: 1,
+		Sbz1:     0,
+		Control:  0x8004, // SE_DACL_PRESENT | SE_SELF_RELATIVE
+		Owner:    0,
+		Group:    0,
+		Sacl:     0,
+		Dacl:     0, // Will be set after we know the size
+	}
+
+	// Calculate DACL size
+	daclSize := int(unsafe.Sizeof(ACL{}))
+	aceData := [][]byte{}
+
+	for _, perm := range permissions {
+		ace, err := e.buildACE(perm)
+		if err != nil {
+			log.Printf("Warning: failed to build ACE for %s: %v", perm.Account, err)
+			continue
+		}
+		aceData = append(aceData, ace)
+		daclSize += len(ace)
+	}
+
+	// Build DACL
+	dacl := ACL{
+		AclRevision: 2,
+		Sbz1:        0,
+		AclSize:     uint16(daclSize),
+		AceCount:    uint16(len(aceData)),
+		Sbz2:        0,
+	}
+
+	// Set DACL offset in security descriptor
+	sd.Dacl = uint32(unsafe.Sizeof(SecurityDescriptor{}))
+
+	// Build the complete security descriptor
+	buffer = append(buffer, (*(*[unsafe.Sizeof(SecurityDescriptor{})]byte)(unsafe.Pointer(&sd)))[:]...)
+	buffer = append(buffer, (*(*[unsafe.Sizeof(ACL{})]byte)(unsafe.Pointer(&dacl)))[:]...)
+
+	for _, ace := range aceData {
+		buffer = append(buffer, ace...)
+	}
+
+	return buffer, nil
+}
+
+// buildACE creates an Access Control Entry for a permission
+func (e *ETWLocksmith) buildACE(permission Permission) ([]byte, error) {
+	// Convert account name to SID
+	sidBytes, err := e.accountNameToSID(permission.Account)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert account %s to SID: %v", permission.Account, err)
+	}
+
+	// Determine ACE type
+	aceType := byte(0x00) // ACCESS_ALLOWED_ACE_TYPE
+	if permission.Type == "Deny" {
+		aceType = 0x01 // ACCESS_DENIED_ACE_TYPE
+	}
+
+	// Calculate ACE size
+	aceSize := uint16(int(unsafe.Sizeof(ACEHeader{})) + int(unsafe.Sizeof(uint32(0))) + len(sidBytes))
+
+	// Build ACE header
+	header := ACEHeader{
+		AceType:  aceType,
+		AceFlags: 0,
+		AceSize:  aceSize,
+	}
+
+	// Build ACE
+	var buffer []byte
+	buffer = append(buffer, (*(*[unsafe.Sizeof(ACEHeader{})]byte)(unsafe.Pointer(&header)))[:]...)
+
+	// Add access mask
+	maskBytes := (*(*[4]byte)(unsafe.Pointer(&permission.AccessMask)))[:]
+	buffer = append(buffer, maskBytes...)
+
+	// Add SID
+	buffer = append(buffer, sidBytes...)
+
+	return buffer, nil
+}
+
+// accountNameToSID converts an account name to SID bytes
+func (e *ETWLocksmith) accountNameToSID(accountName string) ([]byte, error) {
+	// Well-known SIDs
+	wellKnownSIDs := map[string]string{
+		"Everyone":                  "S-1-1-0",
+		"Administrators":            "S-1-5-32-544",
+		"Users":                     "S-1-5-32-545",
+		"Guests":                    "S-1-5-32-546",
+		"Power Users":               "S-1-5-32-547",
+		"Performance Monitor Users": "S-1-5-32-558",
+		"Performance Log Users":     "S-1-5-32-559",
+		"SYSTEM":                    "S-1-5-18",
+		"LOCAL SERVICE":             "S-1-5-19",
+		"NETWORK SERVICE":           "S-1-5-20",
+		"ALL SERVICES":              "S-1-5-80",
+		"ALL APPLICATION PACKAGES":  "S-1-15-2-1",
+	}
+
+	sidString, exists := wellKnownSIDs[accountName]
+	if !exists {
+		// Try to lookup account using Windows API
+		sid, _, _, err := windows.LookupSID("", accountName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to lookup SID for account %s: %v", accountName, err)
+		}
+		sidString = sid.String()
+	}
+
+	return e.stringToSIDBytes(sidString)
+}
+
+// stringToSIDBytes converts a SID string to bytes
+func (e *ETWLocksmith) stringToSIDBytes(sidString string) ([]byte, error) {
+	// Parse SID string (e.g., "S-1-1-0")
+	parts := strings.Split(sidString, "-")
+	if len(parts) < 3 || parts[0] != "S" {
+		return nil, fmt.Errorf("invalid SID format: %s", sidString)
+	}
+
+	revision, err := strconv.ParseUint(parts[1], 10, 8)
+	if err != nil {
+		return nil, fmt.Errorf("invalid SID revision: %s", parts[1])
+	}
+
+	authority, err := strconv.ParseUint(parts[2], 10, 48)
+	if err != nil {
+		return nil, fmt.Errorf("invalid SID authority: %s", parts[2])
+	}
+
+	var subAuthorities []uint32
+	for i := 3; i < len(parts); i++ {
+		subAuth, err := strconv.ParseUint(parts[i], 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid SID sub-authority: %s", parts[i])
+		}
+		subAuthorities = append(subAuthorities, uint32(subAuth))
+	}
+
+	// Build SID bytes
+	var buffer []byte
+	buffer = append(buffer, byte(revision))
+	buffer = append(buffer, byte(len(subAuthorities)))
+
+	// Authority (6 bytes, big-endian)
+	authBytes := make([]byte, 6)
+	authBytes[0] = byte(authority >> 40)
+	authBytes[1] = byte(authority >> 32)
+	authBytes[2] = byte(authority >> 24)
+	authBytes[3] = byte(authority >> 16)
+	authBytes[4] = byte(authority >> 8)
+	authBytes[5] = byte(authority)
+	buffer = append(buffer, authBytes...)
+
+	// Sub-authorities (4 bytes each, little-endian)
+	for _, subAuth := range subAuthorities {
+		subAuthBytes := (*(*[4]byte)(unsafe.Pointer(&subAuth)))[:]
+		buffer = append(buffer, subAuthBytes...)
+	}
+
+	return buffer, nil
+}
+
+// ParsePermissionFlags converts permission flag strings to access mask
+func (e *ETWLocksmith) ParsePermissionFlags(permissionFlags []string) uint32 {
+	var mask uint32
+
+	for _, flag := range permissionFlags {
+		flag = strings.ToUpper(strings.TrimSpace(flag))
+		for permValue, permName := range ETWPermissions {
+			if strings.ToUpper(permName) == flag {
+				mask |= permValue
+				break
+			}
+		}
+	}
+
+	return mask
+}
+
+// ListAvailableAccounts returns a list of well-known account names
+func (e *ETWLocksmith) ListAvailableAccounts() []string {
+	return []string{
+		"Everyone",
+		"Administrators",
+		"Users",
+		"Guests",
+		"Power Users",
+		"Performance Monitor Users",
+		"Performance Log Users",
+		"SYSTEM",
+		"LOCAL SERVICE",
+		"NETWORK SERVICE",
+		"ALL SERVICES",
+		"ALL APPLICATION PACKAGES",
+	}
+}
+
+// interactivePermissionSetup provides an interactive CLI for setting up permissions
+func (e *ETWLocksmith) interactivePermissionSetup() []Permission {
+	var permissions []Permission
+
+	fmt.Println("\n=== Interactive Permission Setup ===")
+	fmt.Println("You can add multiple permission entries. Each entry specifies:")
+	fmt.Println("- Permission Type (Allow/Deny)")
+	fmt.Println("- Account name")
+	fmt.Println("- Access permissions")
+	fmt.Println()
+
+	for {
+		fmt.Printf("Add permission entry? (y/n): ")
+		var response string
+		fmt.Scanln(&response)
+
+		if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
+			break
+		}
+
+		permission := Permission{}
+
+		// Get permission type
+		fmt.Printf("Permission type (Allow/Deny) [Allow]: ")
+		var permType string
+		fmt.Scanln(&permType)
+		if permType == "" {
+			permType = "Allow"
+		}
+		permission.Type = permType
+
+		// Get account name
+		fmt.Printf("Account name (e.g., Everyone, Administrators, SYSTEM): ")
+		var account string
+		fmt.Scanln(&account)
+		if account == "" {
+			fmt.Println("Account name is required. Skipping this entry.")
+			continue
+		}
+		permission.Account = account
+
+		// Show available permissions
+		fmt.Println("\nAvailable ETW permissions:")
+		var permNames []string
+		for _, name := range ETWPermissions {
+			permNames = append(permNames, name)
+		}
+		sort.Strings(permNames)
+
+		for i, name := range permNames {
+			for mask, permName := range ETWPermissions {
+				if permName == name {
+					fmt.Printf("  %2d. %-30s (0x%08X)\n", i+1, name, mask)
+					break
+				}
+			}
+		}
+
+		// Get permissions
+		fmt.Printf("\nEnter permission numbers (comma-separated, e.g., 1,2,3) or 'all' for all permissions: ")
+		var permInput string
+		fmt.Scanln(&permInput)
+
+		var selectedPerms []string
+		var accessMask uint32
+
+		if strings.ToLower(permInput) == "all" {
+			// Grant all permissions
+			for mask, name := range ETWPermissions {
+				accessMask |= mask
+				selectedPerms = append(selectedPerms, name)
+			}
+		} else {
+			// Parse individual permission numbers
+			parts := strings.Split(permInput, ",")
+			for _, part := range parts {
+				part = strings.TrimSpace(part)
+				if num, err := strconv.Atoi(part); err == nil && num >= 1 && num <= len(permNames) {
+					permName := permNames[num-1]
+					selectedPerms = append(selectedPerms, permName)
+
+					// Find the mask for this permission
+					for mask, name := range ETWPermissions {
+						if name == permName {
+							accessMask |= mask
+							break
+						}
+					}
+				}
+			}
+		}
+
+		if len(selectedPerms) == 0 {
+			fmt.Println("No valid permissions selected. Skipping this entry.")
+			continue
+		}
+
+		permission.AccessMask = accessMask
+		permission.Permissions = selectedPerms
+
+		permissions = append(permissions, permission)
+
+		fmt.Printf("\nAdded permission: %s - %s (0x%08X): %s\n",
+			permission.Type, permission.Account, permission.AccessMask,
+			strings.Join(permission.Permissions, ", "))
+	}
+
+	if len(permissions) > 0 {
+		fmt.Println("\n=== Summary of Permissions ===")
+		for i, perm := range permissions {
+			fmt.Printf("  %d. %s - %s (0x%08X): %s\n", i+1,
+				perm.Type, perm.Account, perm.AccessMask,
+				strings.Join(perm.Permissions, ", "))
+		}
+
+		fmt.Printf("\nConfirm these permissions? (y/n): ")
+		var confirm string
+		fmt.Scanln(&confirm)
+		if strings.ToLower(confirm) != "y" && strings.ToLower(confirm) != "yes" {
+			fmt.Println("Permissions cancelled.")
+			return []Permission{}
+		}
+	}
+
+	return permissions
+}
+
 func (e *ETWLocksmith) GetDefaultPermissions() *Provider {
 	if provider, exists := e.providers[DEFAULT_ETW_GUID]; exists {
 		defaultProvider := &Provider{
@@ -628,8 +1025,70 @@ func (e *ETWLocksmith) SearchByPermission(permissionName string) []*Provider {
 		for _, perm := range provider.Permissions {
 			for _, p := range perm.Permissions {
 				if strings.ToUpper(p) == permissionName {
+					// Resolve provider name if not already set
+					if provider.Name == "" || provider.Name == "Unknown Provider" {
+						resolvedName := e.resolveProviderName(strings.Trim(provider.GUID, "{}"))
+						if resolvedName != "" && resolvedName != "Unknown Provider" {
+							provider.Name = resolvedName
+						}
+					}
 					results = append(results, provider)
 					goto nextProvider
+				}
+			}
+		}
+	nextProvider:
+	}
+
+	return results
+}
+
+func (e *ETWLocksmith) SearchByAccount(accountName string) []*Provider {
+	var results []*Provider
+
+	accountName = strings.ToUpper(accountName)
+
+	for _, provider := range e.providers {
+		for _, perm := range provider.Permissions {
+			if strings.ToUpper(perm.Account) == accountName {
+				// Resolve provider name if not already set
+				if provider.Name == "" || provider.Name == "Unknown Provider" {
+					resolvedName := e.resolveProviderName(strings.Trim(provider.GUID, "{}"))
+					if resolvedName != "" && resolvedName != "Unknown Provider" {
+						provider.Name = resolvedName
+					}
+				}
+				results = append(results, provider)
+				goto nextProvider
+			}
+		}
+	nextProvider:
+	}
+
+	return results
+}
+
+func (e *ETWLocksmith) SearchByAccountAndPermission(accountName string, permissionName string) []*Provider {
+	var results []*Provider
+
+	accountName = strings.ToUpper(accountName)
+	permissionName = strings.ToUpper(permissionName)
+
+	for _, provider := range e.providers {
+		for _, perm := range provider.Permissions {
+			if strings.ToUpper(perm.Account) == accountName {
+				for _, p := range perm.Permissions {
+					if strings.ToUpper(p) == permissionName {
+						// Resolve provider name if not already set
+						if provider.Name == "" || provider.Name == "Unknown Provider" {
+							resolvedName := e.resolveProviderName(strings.Trim(provider.GUID, "{}"))
+							if resolvedName != "" && resolvedName != "Unknown Provider" {
+								provider.Name = resolvedName
+							}
+						}
+						results = append(results, provider)
+						goto nextProvider
+					}
 				}
 			}
 		}
@@ -1044,9 +1503,224 @@ func main() {
 				}
 				for _, perm := range provider.Permissions {
 					for _, p := range perm.Permissions {
-						if strings.ToUpper(p) == strings.ToUpper(args[0]) {
+						if strings.EqualFold(p, args[0]) {
 							fmt.Printf("  %s - %s (0x%08X)\n",
 								perm.Type, perm.Account, perm.AccessMask)
+						}
+					}
+				}
+				fmt.Println()
+			}
+		},
+	}
+
+	var searchAccountCmd = &cobra.Command{
+		Use:   "search-account [account]",
+		Short: "Search for providers with permissions for a specific account",
+		Long:  "Search for ETW providers that have permissions assigned to a specific account (e.g., Everyone, Administrators, SYSTEM)",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := locksmith.LoadProviders(); err != nil {
+				log.Fatalf("Failed to load ETW providers: %v", err)
+			}
+			providers := locksmith.SearchByAccount(args[0])
+
+			fmt.Printf("Found %d providers with permissions for account '%s':\n\n", len(providers), args[0])
+
+			for _, provider := range providers {
+				// Ensure provider name is resolved - try to get a better name even if one exists
+				resolvedName := locksmith.resolveProviderName(strings.Trim(provider.GUID, "{}"))
+				if resolvedName != "" && resolvedName != "Unknown Provider" && resolvedName != provider.GUID {
+					provider.Name = resolvedName
+				} else if provider.Name == "" || provider.Name == "Unknown Provider" || provider.Name == provider.GUID {
+					// If we still don't have a good name, try additional resolution
+					if resolvedName != "" && resolvedName != "Unknown Provider" {
+						provider.Name = resolvedName
+					}
+				}
+
+				fmt.Printf("GUID: %s\n", provider.GUID)
+				if provider.Name != "" {
+					fmt.Printf("Name: %s\n", provider.Name)
+				}
+				fmt.Printf("Security Permissions Registered: %t\n", provider.SecurityPermissionsRegistered)
+				fmt.Printf("Permissions for %s:\n", args[0])
+				for _, perm := range provider.Permissions {
+					if strings.EqualFold(perm.Account, args[0]) {
+						fmt.Printf("  %s - %s (0x%08X): %s\n",
+							perm.Type, perm.Account, perm.AccessMask,
+							strings.Join(perm.Permissions, ", "))
+					}
+				}
+				fmt.Println()
+			}
+		},
+	}
+
+	var searchEveryoneCmd = &cobra.Command{
+		Use:   "search-everyone",
+		Short: "Search for providers with permissions for Everyone",
+		Long:  "Search for ETW providers that have permissions assigned to the Everyone group. This is useful for identifying potential security issues.",
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := locksmith.LoadProviders(); err != nil {
+				log.Fatalf("Failed to load ETW providers: %v", err)
+			}
+			providers := locksmith.SearchByAccount("Everyone")
+
+			fmt.Printf("Found %d providers with permissions for Everyone:\n\n", len(providers))
+
+			if len(providers) == 0 {
+				fmt.Println("No providers found with Everyone permissions.")
+				return
+			}
+
+			for _, provider := range providers {
+				// Ensure provider name is resolved - try to get a better name even if one exists
+				resolvedName := locksmith.resolveProviderName(strings.Trim(provider.GUID, "{}"))
+				if resolvedName != "" && resolvedName != "Unknown Provider" && resolvedName != provider.GUID {
+					provider.Name = resolvedName
+				} else if provider.Name == "" || provider.Name == "Unknown Provider" || provider.Name == provider.GUID {
+					// If we still don't have a good name, try additional resolution
+					if resolvedName != "" && resolvedName != "Unknown Provider" {
+						provider.Name = resolvedName
+					}
+				}
+
+				fmt.Printf("GUID: %s\n", provider.GUID)
+				if provider.Name != "" {
+					fmt.Printf("Name: %s\n", provider.Name)
+				}
+				fmt.Printf("Security Permissions Registered: %t\n", provider.SecurityPermissionsRegistered)
+				fmt.Printf("Permissions for Everyone:\n")
+				for _, perm := range provider.Permissions {
+					if strings.EqualFold(perm.Account, "Everyone") {
+						fmt.Printf("  %s - %s (0x%08X): %s\n",
+							perm.Type, perm.Account, perm.AccessMask,
+							strings.Join(perm.Permissions, ", "))
+					}
+				}
+				fmt.Println()
+			}
+
+			fmt.Println("Note: Providers with Everyone permissions may pose security risks.")
+			fmt.Println("Consider reviewing these permissions and restricting access where appropriate.")
+		},
+	}
+
+	var searchEveryonePermissionCmd = &cobra.Command{
+		Use:   "search-everyone-permission [permission]",
+		Short: "Search for providers with specific permissions for Everyone",
+		Long:  "Search for ETW providers that have a specific permission assigned to the Everyone group. This is useful for identifying specific security risks.",
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := locksmith.LoadProviders(); err != nil {
+				log.Fatalf("Failed to load ETW providers: %v", err)
+			}
+			permissionName := args[0]
+			providers := locksmith.SearchByAccountAndPermission("Everyone", permissionName)
+
+			fmt.Printf("Found %d providers with '%s' permission for Everyone:\n\n", len(providers), permissionName)
+
+			if len(providers) == 0 {
+				fmt.Printf("No providers found with '%s' permission for Everyone.\n", permissionName)
+				return
+			}
+
+			for _, provider := range providers {
+				// Ensure provider name is resolved - try to get a better name even if one exists
+				resolvedName := locksmith.resolveProviderName(strings.Trim(provider.GUID, "{}"))
+				if resolvedName != "" && resolvedName != "Unknown Provider" && resolvedName != provider.GUID {
+					provider.Name = resolvedName
+				} else if provider.Name == "" || provider.Name == "Unknown Provider" || provider.Name == provider.GUID {
+					// If we still don't have a good name, try additional resolution
+					if resolvedName != "" && resolvedName != "Unknown Provider" {
+						provider.Name = resolvedName
+					}
+				}
+
+				fmt.Printf("GUID: %s\n", provider.GUID)
+				if provider.Name != "" {
+					fmt.Printf("Name: %s\n", provider.Name)
+				}
+				fmt.Printf("Security Permissions Registered: %t\n", provider.SecurityPermissionsRegistered)
+				fmt.Printf("Everyone permissions:\n")
+				for _, perm := range provider.Permissions {
+					if strings.EqualFold(perm.Account, "Everyone") {
+						// Check if this permission entry contains the searched permission
+						hasPermission := false
+						for _, p := range perm.Permissions {
+							if strings.EqualFold(p, permissionName) {
+								hasPermission = true
+								break
+							}
+						}
+						if hasPermission {
+							fmt.Printf("  %s - %s (0x%08X): %s\n",
+								perm.Type, perm.Account, perm.AccessMask,
+								strings.Join(perm.Permissions, ", "))
+						}
+					}
+				}
+				fmt.Println()
+			}
+
+			fmt.Printf("Note: Providers with '%s' permission for Everyone may pose security risks.\n", permissionName)
+			fmt.Println("Consider reviewing these permissions and restricting access where appropriate.")
+		},
+	}
+
+	var searchAccountPermissionCmd = &cobra.Command{
+		Use:   "search-account-permission [account] [permission]",
+		Short: "Search for providers with specific permissions for a specific account",
+		Long:  "Search for ETW providers that have a specific permission assigned to a specific account (e.g., Everyone, Administrators, SYSTEM)",
+		Args:  cobra.ExactArgs(2),
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := locksmith.LoadProviders(); err != nil {
+				log.Fatalf("Failed to load ETW providers: %v", err)
+			}
+			accountName := args[0]
+			permissionName := args[1]
+			providers := locksmith.SearchByAccountAndPermission(accountName, permissionName)
+
+			fmt.Printf("Found %d providers with '%s' permission for '%s':\n\n", len(providers), permissionName, accountName)
+
+			if len(providers) == 0 {
+				fmt.Printf("No providers found with '%s' permission for '%s'.\n", permissionName, accountName)
+				return
+			}
+
+			for _, provider := range providers {
+				// Ensure provider name is resolved - try to get a better name even if one exists
+				resolvedName := locksmith.resolveProviderName(strings.Trim(provider.GUID, "{}"))
+				if resolvedName != "" && resolvedName != "Unknown Provider" && resolvedName != provider.GUID {
+					provider.Name = resolvedName
+				} else if provider.Name == "" || provider.Name == "Unknown Provider" || provider.Name == provider.GUID {
+					// If we still don't have a good name, try additional resolution
+					if resolvedName != "" && resolvedName != "Unknown Provider" {
+						provider.Name = resolvedName
+					}
+				}
+
+				fmt.Printf("GUID: %s\n", provider.GUID)
+				if provider.Name != "" {
+					fmt.Printf("Name: %s\n", provider.Name)
+				}
+				fmt.Printf("Security Permissions Registered: %t\n", provider.SecurityPermissionsRegistered)
+				fmt.Printf("%s permissions:\n", accountName)
+				for _, perm := range provider.Permissions {
+					if strings.EqualFold(perm.Account, accountName) {
+						// Check if this permission entry contains the searched permission
+						hasPermission := false
+						for _, p := range perm.Permissions {
+							if strings.EqualFold(p, permissionName) {
+								hasPermission = true
+								break
+							}
+						}
+						if hasPermission {
+							fmt.Printf("  %s - %s (0x%08X): %s\n",
+								perm.Type, perm.Account, perm.AccessMask,
+								strings.Join(perm.Permissions, ", "))
 						}
 					}
 				}
@@ -1186,8 +1860,129 @@ func main() {
 		},
 	}
 
+	var setPermissionsCmd = &cobra.Command{
+		Use:   "set-permissions",
+		Short: "Set or modify ETW provider permissions",
+	}
+
+	var setProviderPermCmd = &cobra.Command{
+		Use:   "provider [guid]",
+		Short: "Set permissions for a specific ETW provider",
+		Long: `Set permissions for a specific ETW provider. This will create or update the registry entry.
+		
+Example:
+  etwlocksmith set-permissions provider {12345678-1234-1234-1234-123456789ABC}
+  
+This will start an interactive session to configure permissions for the specified provider.`,
+		Args: cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			guid := args[0]
+
+			// Normalize GUID
+			guid = strings.ToUpper(strings.Trim(guid, "{}"))
+			if !strings.HasPrefix(guid, "{") {
+				guid = "{" + guid + "}"
+			}
+
+			if err := locksmith.LoadProviders(); err != nil {
+				log.Fatalf("Failed to load ETW providers: %v", err)
+			}
+
+			fmt.Printf("Setting permissions for ETW provider: %s\n", guid)
+
+			// Check if provider exists and show current permissions
+			if provider, exists := locksmith.providers[guid]; exists {
+				fmt.Printf("Current permissions for %s (%s):\n", provider.Name, provider.GUID)
+				for i, perm := range provider.Permissions {
+					fmt.Printf("  %d. %s - %s (0x%08X): %s\n", i+1,
+						perm.Type, perm.Account, perm.AccessMask,
+						strings.Join(perm.Permissions, ", "))
+				}
+			} else {
+				fmt.Printf("Provider %s has no registered permissions. Will create new entry.\n", guid)
+			}
+
+			fmt.Println("\nStarting interactive permission configuration...")
+			permissions := locksmith.interactivePermissionSetup()
+
+			if len(permissions) == 0 {
+				fmt.Println("No permissions configured. Exiting.")
+				return
+			}
+
+			if err := locksmith.SetProviderPermissions(guid, permissions); err != nil {
+				log.Fatalf("Failed to set permissions: %v", err)
+			}
+
+			fmt.Printf("Successfully set permissions for provider %s\n", guid)
+
+			// Show the new permissions
+			updatedProvider := locksmith.SearchByGUID(guid)
+			fmt.Printf("\nNew permissions for %s:\n", updatedProvider.GUID)
+			for i, perm := range updatedProvider.Permissions {
+				fmt.Printf("  %d. %s - %s (0x%08X): %s\n", i+1,
+					perm.Type, perm.Account, perm.AccessMask,
+					strings.Join(perm.Permissions, ", "))
+			}
+		},
+	}
+
+	var setDefaultPermCmd = &cobra.Command{
+		Use:   "default",
+		Short: "Set default permissions for unregistered ETW providers",
+		Long: `Set default permissions that will be applied to ETW providers that don't have 
+specific security permissions registered in the registry.
+
+This modifies the default ETW GUID: ` + DEFAULT_ETW_GUID,
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := locksmith.LoadProviders(); err != nil {
+				log.Fatalf("Failed to load ETW providers: %v", err)
+			}
+
+			fmt.Printf("Setting default permissions for unregistered ETW providers\n")
+			fmt.Printf("Default GUID: %s\n", DEFAULT_ETW_GUID)
+
+			// Show current default permissions
+			defaultProvider := locksmith.GetDefaultPermissions()
+			fmt.Printf("Current default permissions:\n")
+			for i, perm := range defaultProvider.Permissions {
+				fmt.Printf("  %d. %s - %s (0x%08X): %s\n", i+1,
+					perm.Type, perm.Account, perm.AccessMask,
+					strings.Join(perm.Permissions, ", "))
+			}
+
+			fmt.Println("\nStarting interactive permission configuration...")
+			permissions := locksmith.interactivePermissionSetup()
+
+			if len(permissions) == 0 {
+				fmt.Println("No permissions configured. Exiting.")
+				return
+			}
+
+			if err := locksmith.SetProviderPermissions(DEFAULT_ETW_GUID, permissions); err != nil {
+				log.Fatalf("Failed to set default permissions: %v", err)
+			}
+
+			fmt.Printf("Successfully set default permissions for unregistered providers\n")
+		},
+	}
+
+	var listAccountsCmd = &cobra.Command{
+		Use:   "list-accounts",
+		Short: "List available account names for permission configuration",
+		Run: func(cmd *cobra.Command, args []string) {
+			accounts := locksmith.ListAvailableAccounts()
+			fmt.Println("Available account names:")
+			for i, account := range accounts {
+				fmt.Printf("  %d. %s\n", i+1, account)
+			}
+			fmt.Println("\nNote: You can also use custom account names or SIDs.")
+		},
+	}
+
 	exportCmd.AddCommand(exportJSONCmd, exportCSVCmd)
-	rootCmd.AddCommand(listCmd, searchGuidCmd, searchPermCmd, searchNameCmd, loadFromFileCmd, exportCmd, permissionsCmd)
+	setPermissionsCmd.AddCommand(setProviderPermCmd, setDefaultPermCmd, listAccountsCmd)
+	rootCmd.AddCommand(listCmd, searchGuidCmd, searchPermCmd, searchAccountCmd, searchEveryoneCmd, searchEveryonePermissionCmd, searchAccountPermissionCmd, searchNameCmd, loadFromFileCmd, exportCmd, permissionsCmd, setPermissionsCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatal(err)
